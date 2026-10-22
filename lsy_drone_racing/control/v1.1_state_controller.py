@@ -60,6 +60,7 @@ class V1StateController(Controller):
         gates_quat = np.asarray(obs["gates_quat"], dtype=np.float64)
 
         gate_plans = []
+        saved_gate_entries: dict[int, NDArray[np.float64]] = {}
         for gate_id, direction in zip(gate_sequence, gate_directions, strict=True):
             center = gates_pos[gate_id]
 
@@ -71,6 +72,15 @@ class V1StateController(Controller):
             exit_point = center + self._gate_offset * normal
             approach = self._move_staging_point_away_from_obstacles(approach, normal)
             exit_point = self._move_staging_point_away_from_obstacles(exit_point, normal)
+
+            # Repeated occurrences of a physical gate must use exactly the same entry point.  In
+            # the default track this makes the fifth target (gate 2 again) return directly to the
+            # entry used during the first pass instead of inventing another route behind the gate.
+            gate_key = int(gate_id)
+            if gate_key in saved_gate_entries:
+                approach = saved_gate_entries[gate_key].copy()
+            else:
+                saved_gate_entries[gate_key] = approach.copy()
 
             # The outer staging points may move sideways to avoid an obstacle.  These two inner
             # points remain on the gate normal and force the spline to become straight immediately
@@ -84,17 +94,6 @@ class V1StateController(Controller):
 
         for index, gate_plan in enumerate(gate_plans):
             approach, alignment_entry, center, alignment_exit, exit_point, normal = gate_plan
-
-            # The previous gate can leave us on the exit side of this target gate.  Reaching the
-            # target's approach point directly would then cross its plane in the wrong direction.
-            # Move across the plane outside the frame first, and only then approach the opening.
-            if index > 0:
-                previous_point = np.asarray(waypoints[-1])
-                arrives_from_exit_side = np.dot(previous_point - center, normal) > 0.0
-                if arrives_from_exit_side:
-                    outside_exit, outside_entry = self._build_gate_return_bypass(center, normal)
-                    waypoints.extend((outside_exit, outside_entry))
-
             waypoints.extend(
                 (approach, alignment_entry, center, alignment_exit, exit_point)
             )
@@ -108,7 +107,10 @@ class V1StateController(Controller):
                 if next_is_on_entry_side:
                     waypoints.extend(self._build_gate_return_bypass(center, normal))
 
-        return self._insert_avoidance_waypoints(np.asarray(waypoints, dtype=np.float64))
+        # Staging points have already been moved away from nearby obstacles.  Do not insert
+        # additional detours between gates: for a repeated gate, the next target must remain the
+        # exact entry point saved during its first occurrence.
+        return np.asarray(waypoints, dtype=np.float64)
 
     def _build_gate_return_bypass(
         self, center: NDArray[np.float64], normal: NDArray[np.float64]
@@ -174,80 +176,6 @@ class V1StateController(Controller):
             for candidate in candidates
         ]
         return candidates[int(np.argmax(clearances))]
-
-    @staticmethod
-    def _point_to_segment_distance(
-        point: NDArray[np.float64], start: NDArray[np.float64], end: NDArray[np.float64]
-    ) -> tuple[float, float]:
-        """Return horizontal point-to-segment distance and the closest segment parameter."""
-        segment = end[:2] - start[:2]
-        length_squared = float(segment @ segment)
-        if length_squared < 1e-12:
-            return float(np.linalg.norm(point[:2] - start[:2])), 0.0
-        parameter = float(np.clip((point[:2] - start[:2]) @ segment / length_squared, 0.0, 1.0))
-        closest = start[:2] + parameter * segment
-        return float(np.linalg.norm(point[:2] - closest)), parameter
-
-    def _insert_avoidance_waypoints(
-        self, waypoints: NDArray[np.float64]
-    ) -> NDArray[np.float64]:
-        """Insert a two-point lateral detour when a path segment crosses an obstacle buffer."""
-        if not len(self._obstacles):
-            return waypoints
-
-        required_clearance = self._obstacle_clearance + self._avoidance_margin
-        result = [waypoints[0]]
-
-        for end in waypoints[1:]:
-            start = result[-1]
-            segment_xy = end[:2] - start[:2]
-            segment_length = np.linalg.norm(segment_xy)
-            if segment_length < 1e-6:
-                result.append(end)
-                continue
-
-            direction = segment_xy / segment_length
-            lateral = np.array([-direction[1], direction[0]])
-            conflicts = []
-            for obstacle in self._obstacles:
-                distance, parameter = self._point_to_segment_distance(obstacle, start, end)
-                if distance < required_clearance and 0.0 < parameter < 1.0:
-                    conflicts.append((parameter, obstacle))
-
-            for parameter, obstacle in sorted(conflicts, key=lambda item: item[0]):
-                height = start[2] + parameter * (end[2] - start[2])
-                lookahead = min(0.25, segment_length * 0.2)
-                best_pair = None
-                best_clearance = -np.inf
-
-                for sign in (1.0, -1.0):
-                    side_offset = sign * required_clearance * lateral
-                    before = np.array(
-                        [
-                            *(obstacle[:2] - lookahead * direction + side_offset),
-                            height,
-                        ]
-                    )
-                    after = np.array(
-                        [
-                            *(obstacle[:2] + lookahead * direction + side_offset),
-                            height,
-                        ]
-                    )
-                    pair_clearance = min(
-                        np.min(np.linalg.norm(self._obstacles[:, :2] - before[:2], axis=1)),
-                        np.min(np.linalg.norm(self._obstacles[:, :2] - after[:2], axis=1)),
-                    )
-                    if pair_clearance > best_clearance:
-                        best_pair = (before, after)
-                        best_clearance = pair_clearance
-
-                if best_pair is not None:
-                    result.extend(best_pair)
-
-            result.append(end)
-
-        return np.asarray(result, dtype=np.float64)
 
     def _allocate_waypoint_times(self, waypoints: NDArray[np.float64]) -> NDArray[np.float64]:
         """Assign more time to long segments and keep short segments numerically well behaved."""
