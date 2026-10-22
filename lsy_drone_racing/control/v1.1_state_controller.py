@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 from crazyflow.sim.visualize import draw_line, draw_points
-from scipy.interpolate import CubicSpline
+from scipy.interpolate import PchipInterpolator
 from scipy.spatial.transform import Rotation as R
 
 from lsy_drone_racing.control import Controller
@@ -38,12 +38,11 @@ class V1StateController(Controller):
         self._waypoint_times = self._allocate_waypoint_times(self._waypoints)
         self._t_total = float(self._waypoint_times[-1])
 
-        # Clamped boundary conditions start and end the trajectory at rest.  The spline still has
-        # continuous position, velocity, and acceleration at all internal waypoints.
-        self._position_spline = CubicSpline(
-            self._waypoint_times,
-            self._waypoints,
-            bc_type=((1, np.zeros(3)), (1, np.zeros(3))),
+        # A global cubic spline can overshoot badly after avoidance points and create loops that
+        # approach a gate from the wrong side.  PCHIP is shape-preserving in each coordinate: it
+        # passes through every waypoint without introducing coordinate-wise overshoot.
+        self._position_spline = PchipInterpolator(
+            self._waypoint_times, self._waypoints, axis=0
         )
 
     def _build_waypoints(
