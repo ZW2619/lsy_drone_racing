@@ -1,3 +1,4 @@
+
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
@@ -24,6 +25,7 @@ class V1StateController(Controller):
         self._cruise_speed = 0.55  # Conservative Level-0 starting value [m/s].
         self._gate_offset = 0.45  # Approach/exit distance from the gate plane [m].
         self._gate_alignment_offset = 0.12  # Keep the local path normal to the gate [m].
+        self._gate_bypass_offset = 0.65  # Cross back outside the physical gate frame [m].
         self._takeoff_height = 0.45  # Initial height before flying towards gate 1 [m].
         self._minimum_segment_time = 0.45  # Avoid very short, aggressive spline segments [s].
         self._obstacle_clearance = 0.30  # Horizontal clearance from obstacle centers [m].
@@ -58,6 +60,7 @@ class V1StateController(Controller):
         gates_pos = np.asarray(obs["gates_pos"], dtype=np.float64)
         gates_quat = np.asarray(obs["gates_quat"], dtype=np.float64)
 
+        gate_plans = []
         for gate_id, direction in zip(gate_sequence, gate_directions, strict=True):
             center = gates_pos[gate_id]
 
@@ -76,11 +79,56 @@ class V1StateController(Controller):
             # same physical gate occurs more than once in the gate sequence.
             alignment_entry = center - self._gate_alignment_offset * normal
             alignment_exit = center + self._gate_alignment_offset * normal
+            gate_plans.append(
+                (approach, alignment_entry, center, alignment_exit, exit_point, normal)
+            )
+
+        for index, gate_plan in enumerate(gate_plans):
+            approach, alignment_entry, center, alignment_exit, exit_point, normal = gate_plan
             waypoints.extend(
                 (approach, alignment_entry, center, alignment_exit, exit_point)
             )
 
+            # After a valid pass, the next gate may lie back on the entry side of the current gate.
+            # Returning directly would send the trajectory backwards through the same opening.
+            # Instead, cross the current gate plane again outside its physical frame.
+            if index + 1 < len(gate_plans):
+                next_approach = gate_plans[index + 1][0]
+                next_is_on_entry_side = np.dot(next_approach - center, normal) < 0.0
+                if next_is_on_entry_side:
+                    waypoints.extend(self._build_gate_return_bypass(center, normal))
+
         return self._insert_avoidance_waypoints(np.asarray(waypoints, dtype=np.float64))
+
+    def _build_gate_return_bypass(
+        self, center: NDArray[np.float64], normal: NDArray[np.float64]
+    ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+        """Create two points that return across a gate plane outside the gate frame."""
+        lateral = np.array([-normal[1], normal[0], 0.0], dtype=np.float64)
+        lateral_norm = np.linalg.norm(lateral)
+        if lateral_norm < 1e-6:
+            lateral = np.array([0.0, 1.0, 0.0])
+        else:
+            lateral /= lateral_norm
+
+        candidates = []
+        for sign in (1.0, -1.0):
+            side_offset = sign * self._gate_bypass_offset * lateral
+            exit_side = center + self._gate_offset * normal + side_offset
+            entry_side = center - self._gate_offset * normal + side_offset
+            candidates.append((exit_side, entry_side))
+
+        # Choose the side that stays farthest from all known obstacle centers.
+        if len(self._obstacles):
+            clearances = [
+                min(
+                    np.min(np.linalg.norm(self._obstacles[:, :2] - pair[0][:2], axis=1)),
+                    np.min(np.linalg.norm(self._obstacles[:, :2] - pair[1][:2], axis=1)),
+                )
+                for pair in candidates
+            ]
+            return candidates[int(np.argmax(clearances))]
+        return candidates[0]
 
     def _move_staging_point_away_from_obstacles(
         self, point: NDArray[np.float64], gate_normal: NDArray[np.float64]
