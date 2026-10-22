@@ -23,6 +23,7 @@ class V1StateController(Controller):
         self._freq = float(config.env.freq)
         self._cruise_speed = 0.55  # Conservative Level-0 starting value [m/s].
         self._gate_offset = 0.45  # Approach/exit distance from the gate plane [m].
+        self._gate_alignment_offset = 0.12  # Keep the local path normal to the gate [m].
         self._takeoff_height = 0.45  # Initial height before flying towards gate 1 [m].
         self._minimum_segment_time = 0.45  # Avoid very short, aggressive spline segments [s].
         self._obstacle_clearance = 0.30  # Horizontal clearance from obstacle centers [m].
@@ -68,7 +69,16 @@ class V1StateController(Controller):
             exit_point = center + self._gate_offset * normal
             approach = self._move_staging_point_away_from_obstacles(approach, normal)
             exit_point = self._move_staging_point_away_from_obstacles(exit_point, normal)
-            waypoints.extend((approach, center, exit_point))
+
+            # The outer staging points may move sideways to avoid an obstacle.  These two inner
+            # points remain on the gate normal and force the spline to become straight immediately
+            # before and after crossing the gate plane.  This is especially important when the
+            # same physical gate occurs more than once in the gate sequence.
+            alignment_entry = center - self._gate_alignment_offset * normal
+            alignment_exit = center + self._gate_alignment_offset * normal
+            waypoints.extend(
+                (approach, alignment_entry, center, alignment_exit, exit_point)
+            )
 
         return self._insert_avoidance_waypoints(np.asarray(waypoints, dtype=np.float64))
 
