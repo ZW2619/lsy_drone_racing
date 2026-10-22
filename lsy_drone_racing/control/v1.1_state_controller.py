@@ -85,6 +85,17 @@ class V1StateController(Controller):
 
         for index, gate_plan in enumerate(gate_plans):
             approach, alignment_entry, center, alignment_exit, exit_point, normal = gate_plan
+
+            # The previous gate can leave us on the exit side of this target gate.  Reaching the
+            # target's approach point directly would then cross its plane in the wrong direction.
+            # Move across the plane outside the frame first, and only then approach the opening.
+            if index > 0:
+                previous_point = np.asarray(waypoints[-1])
+                arrives_from_exit_side = np.dot(previous_point - center, normal) > 0.0
+                if arrives_from_exit_side:
+                    outside_exit, outside_entry = self._build_gate_return_bypass(center, normal)
+                    waypoints.extend((outside_exit, outside_entry))
+
             waypoints.extend(
                 (approach, alignment_entry, center, alignment_exit, exit_point)
             )
