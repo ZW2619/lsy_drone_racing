@@ -33,7 +33,7 @@ class V2StateController(Controller):
         self._avoidance_margin = 0.08
         self._avoidance_lookahead = 0.28
         self._entry_tolerance = 0.09
-        self._alignment_tolerance = 0.07
+        self._alignment_tolerance = 0.10
         self._exit_tolerance = 0.18
         self._tracking_slowdown_distance = 0.45
 
@@ -323,26 +323,33 @@ class V2StateController(Controller):
         )
         self._last_desired_position = self._local_waypoints[0].copy()
 
+    def _local_plan_finished(self) -> bool:
+        """Return whether the active local trajectory has reached its final setpoint."""
+        return self._trajectory_time >= self._trajectory_duration - 1e-6
+
     def _advance_phase(self, obs: dict[str, NDArray[np.floating]]) -> None:
         """Advance phases without changing the configured gate order."""
         position = np.asarray(obs["pos"], dtype=np.float64)
         if self._phase == "TO_ENTRY":
             entry_reached = np.linalg.norm(position - self._current_entry) < self._entry_tolerance
-            if entry_reached:
+            # The entry is only a staging target.  If disturbances or an obstacle prevent the
+            # drone from reaching its strict radius, move on to the centered alignment target once
+            # the entry trajectory has completed instead of holding forever.
+            if entry_reached or self._local_plan_finished():
                 self._plan_gate_alignment(obs)
         elif self._phase == "ALIGN_GATE":
             alignment_start = (
                 self._current_center
                 - self._gate_alignment_start_offset * self._current_normal
             )
-            alignment_reached = (
-                np.linalg.norm(position - alignment_start) < self._alignment_tolerance
-            )
-            if alignment_reached:
+            alignment_error = np.linalg.norm(position - alignment_start)
+            alignment_reached = alignment_error < self._alignment_tolerance
+            settled_close_enough = self._local_plan_finished() and alignment_error < 0.16
+            if alignment_reached or settled_close_enough:
                 self._plan_through_gate(obs)
         elif self._phase == "TO_EXIT" and self._pending_pass_index is not None:
             exit_reached = np.linalg.norm(position - self._current_exit) < self._exit_tolerance
-            if exit_reached:
+            if exit_reached or self._local_plan_finished():
                 self._pass_index = self._pending_pass_index
                 self._pending_pass_index = None
                 self._select_current_gate(obs)
