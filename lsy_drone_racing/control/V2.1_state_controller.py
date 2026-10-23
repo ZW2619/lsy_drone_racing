@@ -21,14 +21,15 @@ class V2StateController(Controller):
         super().__init__(obs, info, config)
 
         self._freq = float(config.env.freq)
-        self._cruise_speed = 0.65
-        self._alignment_speed = 0.38
-        self._gate_speed = 0.32
+        self._cruise_speed = 0.80
+        self._alignment_speed = 0.45
+        self._gate_speed = 0.36
         self._gate_offset = 0.45
         self._gate_alignment_start_offset = 0.30
         self._gate_alignment_offset = 0.12
+        self._gate_bypass_offset = 0.62
         self._takeoff_height = 0.45
-        self._minimum_segment_time = 0.30
+        self._minimum_segment_time = 0.24
         self._obstacle_clearance = 0.30
         self._avoidance_margin = 0.08
         self._avoidance_lookahead = 0.28
@@ -162,7 +163,10 @@ class V2StateController(Controller):
         )
 
     def _plan_to_entry(
-        self, obs: dict[str, NDArray[np.floating]], include_takeoff: bool = False
+        self,
+        obs: dict[str, NDArray[np.floating]],
+        include_takeoff: bool = False,
+        departure_gate: tuple[NDArray[np.float64], NDArray[np.float64]] | None = None,
     ) -> None:
         """Plan only the transfer from the current position to the current gate entry."""
         start = np.asarray(obs["pos"], dtype=np.float64)
@@ -173,6 +177,20 @@ class V2StateController(Controller):
             waypoints.append(takeoff)
 
         route_start = waypoints[-1]
+        if departure_gate is not None:
+            previous_center, previous_normal = departure_gate
+            next_entry_is_behind_previous_gate = (
+                np.dot(self._current_entry - previous_center, previous_normal) < 0.0
+            )
+            if next_entry_is_behind_previous_gate:
+                bypass = self._build_departure_bypass(
+                    route_start,
+                    previous_center,
+                    previous_normal,
+                    self._available_obstacles(obs),
+                )
+                waypoints.extend(bypass)
+                route_start = waypoints[-1]
         waypoints.extend(
             self._obstacle_aware_transfer(
                 route_start, self._current_entry, self._available_obstacles(obs)
@@ -180,6 +198,37 @@ class V2StateController(Controller):
         )
         self._phase = "TO_ENTRY"
         self._set_local_plan(waypoints, self._cruise_speed)
+
+    def _build_departure_bypass(
+        self,
+        start: NDArray[np.float64],
+        center: NDArray[np.float64],
+        normal: NDArray[np.float64],
+        obstacles: NDArray[np.float64],
+    ) -> list[NDArray[np.float64]]:
+        """Cross back over a passed gate's plane outside its physical frame."""
+        lateral = np.array([-normal[1], normal[0], 0.0], dtype=np.float64)
+        lateral /= max(np.linalg.norm(lateral), 1e-9)
+        candidates = []
+        for sign in (1.0, -1.0):
+            side = sign * self._gate_bypass_offset * lateral
+            outside_exit = center + self._gate_offset * normal + side
+            outside_entry = center - self._gate_offset * normal + side
+            path_length = np.linalg.norm(outside_exit - start) + np.linalg.norm(
+                outside_entry - outside_exit
+            )
+            if len(obstacles):
+                clearance = min(
+                    np.min(np.linalg.norm(obstacles[:, :2] - outside_exit[:2], axis=1)),
+                    np.min(np.linalg.norm(obstacles[:, :2] - outside_entry[:2], axis=1)),
+                )
+            else:
+                clearance = np.inf
+            candidates.append((clearance, path_length, outside_exit, outside_entry))
+
+        safe = [item for item in candidates if item[0] >= self._obstacle_clearance]
+        selected = min(safe or candidates, key=lambda item: item[1])
+        return [selected[2], selected[3]]
 
     def _plan_through_gate(self, obs: dict[str, NDArray[np.floating]]) -> None:
         """Create a short crossing constrained to the gate normal."""
@@ -350,10 +399,11 @@ class V2StateController(Controller):
         elif self._phase == "TO_EXIT" and self._pending_pass_index is not None:
             exit_reached = np.linalg.norm(position - self._current_exit) < self._exit_tolerance
             if exit_reached or self._local_plan_finished():
+                previous_gate = (self._current_center.copy(), self._current_normal.copy())
                 self._pass_index = self._pending_pass_index
                 self._pending_pass_index = None
                 self._select_current_gate(obs)
-                self._plan_to_entry(obs)
+                self._plan_to_entry(obs, departure_gate=previous_gate)
 
     def compute_control(
         self, obs: dict[str, NDArray[np.floating]], info: dict | None = None
@@ -369,7 +419,7 @@ class V2StateController(Controller):
             np.asarray(obs["pos"], dtype=np.float64) - self._last_desired_position
         )
         time_scale = np.clip(
-            1.0 - tracking_error / self._tracking_slowdown_distance, 0.30, 1.0
+            1.0 - tracking_error / self._tracking_slowdown_distance, 0.40, 1.0
         )
         self._trajectory_time = min(
             self._trajectory_time + time_scale / self._freq, self._trajectory_duration
