@@ -24,6 +24,7 @@ class V2StateController(Controller):
         self._cruise_speed = 0.42
         self._gate_offset = 0.45
         self._gate_alignment_offset = 0.12
+        self._gate_recovery_offset = 0.62
         self._takeoff_height = 0.45
         self._minimum_segment_time = 0.45
         self._obstacle_clearance = 0.25
@@ -117,7 +118,20 @@ class V2StateController(Controller):
         # A newly observed gate may move while the drone is already near its nominal approach.
         # Do not command a return to a staging point that is already behind the drone.
         local_x = float(np.dot(current_position - center, normal))
-        if local_x < -self._gate_alignment_offset:
+        if local_x >= 0.0:
+            # The gate has not been counted yet, but the drone is already on its exit side.  This
+            # can happen when the true pose is revealed late and differs from the nominal pose.
+            # Never command the center from here, because that would cross the gate backwards.
+            # Return to the entry side outside the physical frame first.
+            waypoints.extend(
+                self._build_entry_side_recovery(
+                    current_position, center, normal, obstacles
+                )
+            )
+            if np.linalg.norm(waypoints[-1] - approach) > 0.12:
+                waypoints.append(approach)
+            waypoints.append(alignment_entry)
+        elif local_x < -self._gate_alignment_offset:
             if np.linalg.norm(current_position - approach) > 0.12:
                 waypoints.extend(self._route_to_approach(current_position, approach, obstacles))
             waypoints.append(alignment_entry)
@@ -138,6 +152,42 @@ class V2StateController(Controller):
         self._planned_gate_pos = center
         self._planned_gate_quat = quaternion
         self._last_desired_position = current_position.copy()
+
+    def _build_entry_side_recovery(
+        self,
+        start: NDArray[np.float64],
+        center: NDArray[np.float64],
+        normal: NDArray[np.float64],
+        obstacles: NDArray[np.float64],
+    ) -> list[NDArray[np.float64]]:
+        """Return from a gate's exit side to its entry side outside the gate frame."""
+        lateral = np.array([-normal[1], normal[0], 0.0], dtype=np.float64)
+        lateral /= max(np.linalg.norm(lateral), 1e-9)
+
+        candidates = []
+        for sign in (1.0, -1.0):
+            side_offset = sign * self._gate_recovery_offset * lateral
+            outside_exit = center + self._gate_offset * normal + side_offset
+            outside_entry = center - self._gate_offset * normal + side_offset
+            path_length = np.linalg.norm(outside_exit - start) + np.linalg.norm(
+                outside_entry - outside_exit
+            )
+            if len(obstacles):
+                clearance = min(
+                    np.min(np.linalg.norm(obstacles[:, :2] - outside_exit[:2], axis=1)),
+                    np.min(np.linalg.norm(obstacles[:, :2] - outside_entry[:2], axis=1)),
+                )
+            else:
+                clearance = np.inf
+            candidates.append((clearance, path_length, outside_exit, outside_entry))
+
+        safe_candidates = [
+            candidate
+            for candidate in candidates
+            if candidate[0] >= self._obstacle_clearance
+        ]
+        selected = min(safe_candidates or candidates, key=lambda item: item[1])
+        return [selected[2], selected[3]]
 
     def _route_to_approach(
         self,
