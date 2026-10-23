@@ -21,14 +21,14 @@ class V2StateController(Controller):
         super().__init__(obs, info, config)
 
         self._freq = float(config.env.freq)
-        self._cruise_speed = 0.40
-        self._alignment_speed = 0.25
-        self._gate_speed = 0.22
+        self._cruise_speed = 0.65
+        self._alignment_speed = 0.38
+        self._gate_speed = 0.32
         self._gate_offset = 0.45
         self._gate_alignment_start_offset = 0.30
         self._gate_alignment_offset = 0.12
         self._takeoff_height = 0.45
-        self._minimum_segment_time = 0.45
+        self._minimum_segment_time = 0.30
         self._obstacle_clearance = 0.30
         self._avoidance_margin = 0.08
         self._avoidance_lookahead = 0.28
@@ -369,7 +369,7 @@ class V2StateController(Controller):
             np.asarray(obs["pos"], dtype=np.float64) - self._last_desired_position
         )
         time_scale = np.clip(
-            1.0 - tracking_error / self._tracking_slowdown_distance, 0.15, 1.0
+            1.0 - tracking_error / self._tracking_slowdown_distance, 0.30, 1.0
         )
         self._trajectory_time = min(
             self._trajectory_time + time_scale / self._freq, self._trajectory_duration
