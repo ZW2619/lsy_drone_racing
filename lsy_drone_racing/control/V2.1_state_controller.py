@@ -27,7 +27,7 @@ class V2StateController(Controller):
         self._gate_offset = 0.45
         self._gate_alignment_start_offset = 0.30
         self._gate_alignment_offset = 0.12
-        self._gate_bypass_offset = 0.62
+        self._gate_bypass_offset = 0.85
         self._takeoff_height = 0.45
         self._minimum_segment_time = 0.24
         self._obstacle_clearance = 0.30
@@ -213,22 +213,28 @@ class V2StateController(Controller):
         for sign in (1.0, -1.0):
             side = sign * self._gate_bypass_offset * lateral
             outside_exit = center + self._gate_offset * normal + side
+            outside_plane = center + side
             outside_entry = center - self._gate_offset * normal + side
-            path_length = np.linalg.norm(outside_exit - start) + np.linalg.norm(
-                outside_entry - outside_exit
+            path_length = (
+                np.linalg.norm(outside_exit - start)
+                + np.linalg.norm(outside_plane - outside_exit)
+                + np.linalg.norm(outside_entry - outside_plane)
             )
             if len(obstacles):
                 clearance = min(
                     np.min(np.linalg.norm(obstacles[:, :2] - outside_exit[:2], axis=1)),
+                    np.min(np.linalg.norm(obstacles[:, :2] - outside_plane[:2], axis=1)),
                     np.min(np.linalg.norm(obstacles[:, :2] - outside_entry[:2], axis=1)),
                 )
             else:
                 clearance = np.inf
-            candidates.append((clearance, path_length, outside_exit, outside_entry))
+            candidates.append(
+                (clearance, path_length, outside_exit, outside_plane, outside_entry)
+            )
 
         safe = [item for item in candidates if item[0] >= self._obstacle_clearance]
         selected = min(safe or candidates, key=lambda item: item[1])
-        return [selected[2], selected[3]]
+        return [selected[2], selected[3], selected[4]]
 
     def _plan_through_gate(self, obs: dict[str, NDArray[np.floating]]) -> None:
         """Create a short crossing constrained to the gate normal."""
@@ -397,8 +403,10 @@ class V2StateController(Controller):
             if alignment_reached or settled_close_enough:
                 self._plan_through_gate(obs)
         elif self._phase == "TO_EXIT" and self._pending_pass_index is not None:
-            exit_reached = np.linalg.norm(position - self._current_exit) < self._exit_tolerance
-            if exit_reached or self._local_plan_finished():
+            exit_error = np.linalg.norm(position - self._current_exit)
+            exit_reached = exit_error < self._exit_tolerance
+            settled_near_exit = self._local_plan_finished() and exit_error < 0.30
+            if exit_reached or settled_near_exit:
                 previous_gate = (self._current_center.copy(), self._current_normal.copy())
                 self._pass_index = self._pending_pass_index
                 self._pending_pass_index = None
