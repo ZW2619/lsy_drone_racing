@@ -369,9 +369,19 @@ class V2StateController(Controller):
         )
 
         assert self._local_spline is not None
-        desired_position = self._local_spline(self._trajectory_time)
-        desired_velocity = self._local_spline(self._trajectory_time, 1) * time_scale
-        desired_acceleration = self._local_spline(self._trajectory_time, 2) * time_scale**2
+        local_plan_ended = self._trajectory_time >= self._trajectory_duration - 1e-6
+        if local_plan_ended:
+            # PCHIP generally has a non-zero endpoint derivative.  Commanding that derivative
+            # together with a fixed final position makes the drone circle around the target and
+            # can prevent the phase distance threshold from ever being met.  Hold every local
+            # endpoint as a true hover while waiting for the next phase.
+            desired_position = self._local_waypoints[-1].copy()
+            desired_velocity = np.zeros(3)
+            desired_acceleration = np.zeros(3)
+        else:
+            desired_position = self._local_spline(self._trajectory_time)
+            desired_velocity = self._local_spline(self._trajectory_time, 1) * time_scale
+            desired_acceleration = self._local_spline(self._trajectory_time, 2) * time_scale**2
         self._last_desired_position = desired_position.copy()
 
         horizontal_velocity = desired_velocity[:2]
