@@ -14,195 +14,370 @@ if TYPE_CHECKING:
     from numpy.typing import NDArray
 
 
-class V1StateController(Controller):
-    """Follow a gate-derived trajectory using the full-state command interface."""
+class V2StateController(Controller):
+    """Fly to each recorded entry, pass the gate, then select the next ordered entry."""
 
     def __init__(self, obs: dict[str, NDArray[np.floating]], info: dict, config: dict):
         super().__init__(obs, info, config)
 
         self._freq = float(config.env.freq)
-        self._cruise_speed = 0.55  # Conservative Level-0 starting value [m/s].
-        self._gate_offset = 0.45  # Approach/exit distance from the gate plane [m].
-        self._gate_alignment_offset = 0.12  # Keep the local path normal to the gate [m].
-        self._gate_bypass_offset = 0.65  # Cross back outside the physical gate frame [m].
-        self._takeoff_height = 0.45  # Initial height before flying towards gate 1 [m].
-        self._minimum_segment_time = 0.45  # Avoid very short, aggressive spline segments [s].
-        self._obstacle_clearance = 0.30  # Horizontal clearance from obstacle centers [m].
-        self._avoidance_margin = 0.08  # Extra room for tracking error and spline curvature [m].
+        self._cruise_speed = 0.40
+        self._alignment_speed = 0.25
+        self._gate_speed = 0.22
+        self._gate_offset = 0.45
+        self._gate_alignment_start_offset = 0.30
+        self._gate_alignment_offset = 0.12
+        self._takeoff_height = 0.45
+        self._minimum_segment_time = 0.45
+        self._obstacle_clearance = 0.30
+        self._avoidance_margin = 0.08
+        self._avoidance_lookahead = 0.28
+        self._entry_tolerance = 0.09
+        self._alignment_tolerance = 0.07
+        self._exit_tolerance = 0.18
+        self._tracking_slowdown_distance = 0.45
 
-        self._tick = 0
+        self._pass_index = int(obs["n_gates_passed"])
+        self._pending_pass_index: int | None = None
+        self._phase = "TO_ENTRY"
         self._finished = False
-        self._obstacles = np.asarray(obs["obstacles_pos"], dtype=np.float64)
-        self._waypoints = self._build_waypoints(obs)
-        self._waypoint_times = self._allocate_waypoint_times(self._waypoints)
-        self._t_total = float(self._waypoint_times[-1])
+        self._desired_yaw = 0.0
 
-        # A global cubic spline can overshoot badly after avoidance points and create loops that
-        # approach a gate from the wrong side.  PCHIP is shape-preserving in each coordinate: it
-        # passes through every waypoint without introducing coordinate-wise overshoot.
-        self._position_spline = PchipInterpolator(
-            self._waypoint_times, self._waypoints, axis=0
-        )
+        self._known_gate_poses: dict[
+            int, tuple[NDArray[np.float64], NDArray[np.float64]]
+        ] = {}
+        self._recorded_entries: dict[int, NDArray[np.float64]] = {}
+        self._known_obstacles: dict[int, NDArray[np.float64]] = {}
+        self._gate_visited = np.asarray(obs["gates_visited"], dtype=bool).copy()
+        self._obstacles_visited = np.asarray(obs["obstacles_visited"], dtype=bool).copy()
+        self._update_known_objects(obs)
 
-    def _build_waypoints(
+        self._current_gate_id = -1
+        self._current_center = np.zeros(3)
+        self._current_normal = np.array([1.0, 0.0, 0.0])
+        self._current_entry = np.asarray(obs["pos"], dtype=np.float64).copy()
+        self._current_exit = self._current_entry.copy()
+
+        self._local_spline: PchipInterpolator | None = None
+        self._local_waypoints = np.empty((0, 3), dtype=np.float64)
+        self._local_times = np.empty(0, dtype=np.float64)
+        self._trajectory_time = 0.0
+        self._trajectory_duration = 0.0
+        self._last_desired_position = np.asarray(obs["pos"], dtype=np.float64).copy()
+
+        self._select_current_gate(obs)
+        self._plan_to_entry(obs, include_takeoff=True)
+
+    def _update_known_objects(self, obs: dict[str, NDArray[np.floating]]) -> None:
+        """Cache true object poses after they enter sensor range."""
+        for gate_id in np.flatnonzero(np.asarray(obs["gates_visited"], dtype=bool)):
+            gate_id = int(gate_id)
+            self._known_gate_poses[gate_id] = (
+                np.asarray(obs["gates_pos"][gate_id], dtype=np.float64).copy(),
+                np.asarray(obs["gates_quat"][gate_id], dtype=np.float64).copy(),
+            )
+
+        for obstacle_id in np.flatnonzero(
+            np.asarray(obs["obstacles_visited"], dtype=bool)
+        ):
+            obstacle_id = int(obstacle_id)
+            self._known_obstacles[obstacle_id] = np.asarray(
+                obs["obstacles_pos"][obstacle_id], dtype=np.float64
+            ).copy()
+
+    def _available_obstacles(
         self, obs: dict[str, NDArray[np.floating]]
     ) -> NDArray[np.float64]:
-        """Create takeoff and approach/center/exit waypoints for the configured gate order."""
-        start = np.asarray(obs["pos"], dtype=np.float64)
-        takeoff = start.copy()
-        takeoff[2] = max(float(start[2]), self._takeoff_height)
-        waypoints = [start, takeoff]
+        obstacles = np.asarray(obs["obstacles_pos"], dtype=np.float64).copy()
+        for obstacle_id, position in self._known_obstacles.items():
+            obstacles[obstacle_id] = position
+        return obstacles
 
-        gate_sequence = np.asarray(obs["gate_sequence"], dtype=np.int64)
-        gate_directions = np.asarray(obs["gate_sequence_direction"], dtype=np.float64)
-        gates_pos = np.asarray(obs["gates_pos"], dtype=np.float64)
-        gates_quat = np.asarray(obs["gates_quat"], dtype=np.float64)
+    def _select_current_gate(self, obs: dict[str, NDArray[np.floating]]) -> None:
+        """Select exactly the gate specified by the ordered pass sequence."""
+        self._current_gate_id = int(obs["gate_sequence"][self._pass_index])
+        direction = float(obs["gate_sequence_direction"][self._pass_index])
 
-        gate_plans = []
-        saved_gate_entries: dict[int, NDArray[np.float64]] = {}
-        for gate_id, direction in zip(gate_sequence, gate_directions, strict=True):
-            center = gates_pos[gate_id]
-
-            # The environment defines a gate crossing along the gate frame's local x-axis.
-            normal = R.from_quat(gates_quat[gate_id]).apply([1.0, 0.0, 0.0])
-            normal *= direction
-
-            approach = center - self._gate_offset * normal
-            exit_point = center + self._gate_offset * normal
-            approach = self._move_staging_point_away_from_obstacles(approach, normal)
-            exit_point = self._move_staging_point_away_from_obstacles(exit_point, normal)
-
-            # Repeated occurrences of a physical gate must use exactly the same entry point.  In
-            # the default track this makes the fifth target (gate 2 again) return directly to the
-            # entry used during the first pass instead of inventing another route behind the gate.
-            gate_key = int(gate_id)
-            if gate_key in saved_gate_entries:
-                approach = saved_gate_entries[gate_key].copy()
-            else:
-                saved_gate_entries[gate_key] = approach.copy()
-
-            # The outer staging points may move sideways to avoid an obstacle.  These two inner
-            # points remain on the gate normal and force the spline to become straight immediately
-            # before and after crossing the gate plane.  This is especially important when the
-            # same physical gate occurs more than once in the gate sequence.
-            alignment_entry = center - self._gate_alignment_offset * normal
-            alignment_exit = center + self._gate_alignment_offset * normal
-            gate_plans.append(
-                (approach, alignment_entry, center, alignment_exit, exit_point, normal)
-            )
-
-        for index, gate_plan in enumerate(gate_plans):
-            approach, alignment_entry, center, alignment_exit, exit_point, normal = gate_plan
-            waypoints.extend(
-                (approach, alignment_entry, center, alignment_exit, exit_point)
-            )
-
-            # After a valid pass, the next gate may lie back on the entry side of the current gate.
-            # Returning directly would send the trajectory backwards through the same opening.
-            # Instead, cross the current gate plane again outside its physical frame.
-            if index + 1 < len(gate_plans):
-                next_approach = gate_plans[index + 1][0]
-                next_is_on_entry_side = np.dot(next_approach - center, normal) < 0.0
-                if next_is_on_entry_side:
-                    waypoints.extend(self._build_gate_return_bypass(center, normal))
-
-        # Staging points have already been moved away from nearby obstacles.  Do not insert
-        # additional detours between gates: for a repeated gate, the next target must remain the
-        # exact entry point saved during its first occurrence.
-        return np.asarray(waypoints, dtype=np.float64)
-
-    def _build_gate_return_bypass(
-        self, center: NDArray[np.float64], normal: NDArray[np.float64]
-    ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
-        """Create two points that return across a gate plane outside the gate frame."""
-        lateral = np.array([-normal[1], normal[0], 0.0], dtype=np.float64)
-        lateral_norm = np.linalg.norm(lateral)
-        if lateral_norm < 1e-6:
-            lateral = np.array([0.0, 1.0, 0.0])
+        if self._current_gate_id in self._known_gate_poses:
+            center, quaternion = self._known_gate_poses[self._current_gate_id]
         else:
-            lateral /= lateral_norm
+            center = np.asarray(
+                obs["gates_pos"][self._current_gate_id], dtype=np.float64
+            )
+            quaternion = np.asarray(
+                obs["gates_quat"][self._current_gate_id], dtype=np.float64
+            )
 
+        normal = R.from_quat(quaternion).apply([1.0, 0.0, 0.0]) * direction
+        calculated_entry = center - self._gate_offset * normal
+
+        # The first true observation records a physical gate's entry.  A repeated occurrence such
+        # as the fifth pass through gate 2 reuses this exact point and direction.
+        if self._current_gate_id in self._recorded_entries:
+            entry = self._recorded_entries[self._current_gate_id].copy()
+        else:
+            entry = calculated_entry
+            if self._current_gate_id in self._known_gate_poses:
+                self._recorded_entries[self._current_gate_id] = entry.copy()
+
+        obstacles = self._available_obstacles(obs)
+        entry = self._move_staging_point(entry, normal, obstacles)
+        exit_point = self._move_staging_point(
+            center + self._gate_offset * normal, normal, obstacles
+        )
+
+        self._current_center = center.copy()
+        self._current_normal = normal
+        self._current_entry = entry
+        self._current_exit = exit_point
+
+    def _refresh_current_gate_if_observed(
+        self, obs: dict[str, NDArray[np.floating]]
+    ) -> bool:
+        """Record the active gate's true entry and report whether the entry plan changed."""
+        old_gate_visited = self._gate_visited.copy()
+        old_obstacles_visited = self._obstacles_visited.copy()
+        self._gate_visited = np.asarray(obs["gates_visited"], dtype=bool).copy()
+        self._obstacles_visited = np.asarray(obs["obstacles_visited"], dtype=bool).copy()
+        self._update_known_objects(obs)
+
+        gate_newly_seen = (
+            self._gate_visited[self._current_gate_id]
+            and not old_gate_visited[self._current_gate_id]
+        )
+        obstacle_newly_seen = np.any(self._obstacles_visited & ~old_obstacles_visited)
+        if not (gate_newly_seen or obstacle_newly_seen):
+            return False
+
+        old_entry = self._current_entry.copy()
+        if gate_newly_seen:
+            # Replace a nominal entry by the true entry.  For gate 2 this recorded point is reused
+            # for the fifth pass later in the same episode.
+            self._recorded_entries.pop(self._current_gate_id, None)
+        self._select_current_gate(obs)
+        return bool(
+            gate_newly_seen
+            or obstacle_newly_seen
+            or np.linalg.norm(self._current_entry - old_entry) > 0.01
+        )
+
+    def _plan_to_entry(
+        self, obs: dict[str, NDArray[np.floating]], include_takeoff: bool = False
+    ) -> None:
+        """Plan only the transfer from the current position to the current gate entry."""
+        start = np.asarray(obs["pos"], dtype=np.float64)
+        waypoints = [start.copy()]
+        if include_takeoff and start[2] < self._takeoff_height - 0.05:
+            takeoff = start.copy()
+            takeoff[2] = self._takeoff_height
+            waypoints.append(takeoff)
+
+        route_start = waypoints[-1]
+        waypoints.extend(
+            self._obstacle_aware_transfer(
+                route_start, self._current_entry, self._available_obstacles(obs)
+            )
+        )
+        self._phase = "TO_ENTRY"
+        self._set_local_plan(waypoints, self._cruise_speed)
+
+    def _plan_through_gate(self, obs: dict[str, NDArray[np.floating]]) -> None:
+        """Create a short crossing constrained to the gate normal."""
+        start = np.asarray(obs["pos"], dtype=np.float64)
+        alignment_entry = (
+            self._current_center - self._gate_alignment_offset * self._current_normal
+        )
+        alignment_exit = (
+            self._current_center + self._gate_alignment_offset * self._current_normal
+        )
+        alignment_after = (
+            self._current_center
+            + self._gate_alignment_start_offset * self._current_normal
+        )
+        waypoints = [
+            start,
+            alignment_entry,
+            self._current_center,
+            alignment_exit,
+            alignment_after,
+            self._current_exit,
+        ]
+        self._phase = "THROUGH_GATE"
+        self._set_local_plan(waypoints, self._gate_speed)
+
+    def _plan_gate_alignment(self, obs: dict[str, NDArray[np.floating]]) -> None:
+        """Move to a centered point in front of the gate before starting the crossing."""
+        start = np.asarray(obs["pos"], dtype=np.float64)
+        alignment_start = (
+            self._current_center
+            - self._gate_alignment_start_offset * self._current_normal
+        )
+        self._phase = "ALIGN_GATE"
+        self._set_local_plan([start, alignment_start], self._alignment_speed)
+
+    def _obstacle_aware_transfer(
+        self,
+        start: NDArray[np.float64],
+        target: NDArray[np.float64],
+        obstacles: NDArray[np.float64],
+    ) -> list[NDArray[np.float64]]:
+        """Route to an entry, inserting a two-point detour around the first blocking pole."""
+        if not len(obstacles):
+            return [target.copy()]
+
+        segment = target[:2] - start[:2]
+        segment_length = np.linalg.norm(segment)
+        if segment_length < 1e-6:
+            return [target.copy()]
+        direction = segment / segment_length
+        required_clearance = self._obstacle_clearance + self._avoidance_margin
+
+        conflicts = []
+        for obstacle in obstacles:
+            parameter = float(
+                np.clip((obstacle[:2] - start[:2]) @ direction / segment_length, 0.0, 1.0)
+            )
+            closest = start[:2] + parameter * segment
+            distance = np.linalg.norm(obstacle[:2] - closest)
+            if distance < required_clearance and 0.05 < parameter < 0.95:
+                conflicts.append((parameter, obstacle))
+        if not conflicts:
+            return [target.copy()]
+
+        parameter, obstacle = min(conflicts, key=lambda item: item[0])
+        lateral = np.array([-direction[1], direction[0]])
+        height = start[2] + parameter * (target[2] - start[2])
         candidates = []
         for sign in (1.0, -1.0):
-            side_offset = sign * self._gate_bypass_offset * lateral
-            exit_side = center + self._gate_offset * normal + side_offset
-            entry_side = center - self._gate_offset * normal + side_offset
-            candidates.append((exit_side, entry_side))
+            side = sign * required_clearance * lateral
+            before = np.array(
+                [
+                    *(obstacle[:2] - self._avoidance_lookahead * direction + side),
+                    height,
+                ]
+            )
+            after = np.array(
+                [
+                    *(obstacle[:2] + self._avoidance_lookahead * direction + side),
+                    height,
+                ]
+            )
+            clearance = min(
+                np.min(np.linalg.norm(obstacles[:, :2] - before[:2], axis=1)),
+                np.min(np.linalg.norm(obstacles[:, :2] - after[:2], axis=1)),
+            )
+            path_length = (
+                np.linalg.norm(before - start)
+                + np.linalg.norm(after - before)
+                + np.linalg.norm(target - after)
+            )
+            candidates.append((clearance, path_length, before, after))
 
-        # Choose the side that stays farthest from all known obstacle centers.
-        if len(self._obstacles):
-            clearances = [
-                min(
-                    np.min(np.linalg.norm(self._obstacles[:, :2] - pair[0][:2], axis=1)),
-                    np.min(np.linalg.norm(self._obstacles[:, :2] - pair[1][:2], axis=1)),
-                )
-                for pair in candidates
-            ]
-            return candidates[int(np.argmax(clearances))]
-        return candidates[0]
+        safe = [item for item in candidates if item[0] >= self._obstacle_clearance]
+        selected = min(safe or candidates, key=lambda item: item[1])
+        return [selected[2], selected[3], target.copy()]
 
-    def _move_staging_point_away_from_obstacles(
-        self, point: NDArray[np.float64], gate_normal: NDArray[np.float64]
+    def _move_staging_point(
+        self,
+        point: NDArray[np.float64],
+        normal: NDArray[np.float64],
+        obstacles: NDArray[np.float64],
     ) -> NDArray[np.float64]:
-        """Move an approach/exit point sideways if an obstacle occupies that point.
-
-        Gate centers are never moved.  Only the staging point is shifted within the gate plane, so
-        the resulting trajectory still passes through the exact gate center.
-        """
-        if not len(self._obstacles):
-            return point
-
+        """Move an entry or exit sideways when a pole occupies the nominal point."""
+        if not len(obstacles):
+            return point.copy()
         required_clearance = self._obstacle_clearance + self._avoidance_margin
-        if np.min(np.linalg.norm(self._obstacles[:, :2] - point[:2], axis=1)) >= required_clearance:
-            return point
+        if np.min(np.linalg.norm(obstacles[:, :2] - point[:2], axis=1)) >= required_clearance:
+            return point.copy()
 
-        lateral = np.array([-gate_normal[1], gate_normal[0]], dtype=np.float64)
-        lateral_norm = np.linalg.norm(lateral)
-        if lateral_norm < 1e-6:
-            lateral = np.array([0.0, 1.0])
-        else:
-            lateral /= lateral_norm
-
+        lateral = np.array([-normal[1], normal[0]], dtype=np.float64)
+        lateral /= max(np.linalg.norm(lateral), 1e-9)
         candidates = []
         for sign in (1.0, -1.0):
             candidate = point.copy()
             candidate[:2] += sign * required_clearance * lateral
-            candidates.append(candidate)
+            clearance = np.min(np.linalg.norm(obstacles[:, :2] - candidate[:2], axis=1))
+            candidates.append((clearance, candidate))
+        return max(candidates, key=lambda item: item[0])[1]
 
-        # Pick the side with the largest distance to the closest obstacle.
-        clearances = [
-            np.min(np.linalg.norm(self._obstacles[:, :2] - candidate[:2], axis=1))
-            for candidate in candidates
-        ]
-        return candidates[int(np.argmax(clearances))]
+    def _set_local_plan(
+        self, waypoints: list[NDArray[np.float64]], speed: float
+    ) -> None:
+        """Install a shape-preserving local trajectory."""
+        cleaned = [np.asarray(waypoints[0], dtype=np.float64)]
+        for waypoint in waypoints[1:]:
+            waypoint = np.asarray(waypoint, dtype=np.float64)
+            if np.linalg.norm(waypoint - cleaned[-1]) > 1e-5:
+                cleaned.append(waypoint)
+        if len(cleaned) == 1:
+            cleaned.append(cleaned[0].copy())
+        self._local_waypoints = np.asarray(cleaned)
 
-    def _allocate_waypoint_times(self, waypoints: NDArray[np.float64]) -> NDArray[np.float64]:
-        """Assign more time to long segments and keep short segments numerically well behaved."""
-        distances = np.linalg.norm(np.diff(waypoints, axis=0), axis=1)
-        durations = np.maximum(distances / self._cruise_speed, self._minimum_segment_time)
-        return np.concatenate(([0.0], np.cumsum(durations)))
+        distances = np.linalg.norm(np.diff(self._local_waypoints, axis=0), axis=1)
+        durations = np.maximum(distances / speed, self._minimum_segment_time)
+        self._local_times = np.concatenate(([0.0], np.cumsum(durations)))
+        self._trajectory_time = 0.0
+        self._trajectory_duration = float(self._local_times[-1])
+        self._local_spline = PchipInterpolator(
+            self._local_times, self._local_waypoints, axis=0
+        )
+        self._last_desired_position = self._local_waypoints[0].copy()
+
+    def _advance_phase(self, obs: dict[str, NDArray[np.floating]]) -> None:
+        """Advance phases without changing the configured gate order."""
+        position = np.asarray(obs["pos"], dtype=np.float64)
+        if self._phase == "TO_ENTRY":
+            entry_reached = np.linalg.norm(position - self._current_entry) < self._entry_tolerance
+            if entry_reached:
+                self._plan_gate_alignment(obs)
+        elif self._phase == "ALIGN_GATE":
+            alignment_start = (
+                self._current_center
+                - self._gate_alignment_start_offset * self._current_normal
+            )
+            alignment_reached = (
+                np.linalg.norm(position - alignment_start) < self._alignment_tolerance
+            )
+            if alignment_reached:
+                self._plan_through_gate(obs)
+        elif self._phase == "TO_EXIT" and self._pending_pass_index is not None:
+            exit_reached = np.linalg.norm(position - self._current_exit) < self._exit_tolerance
+            if exit_reached:
+                self._pass_index = self._pending_pass_index
+                self._pending_pass_index = None
+                self._select_current_gate(obs)
+                self._plan_to_entry(obs)
 
     def compute_control(
         self, obs: dict[str, NDArray[np.floating]], info: dict | None = None
     ) -> NDArray[np.float32]:
-        """Return the desired 16-dimensional full-state command."""
-        del obs, info  # V1 follows its Level-0 trajectory open-loop in the planning layer.
+        """Update the ordered state machine and return a full-state command."""
+        del info
 
-        t = min(self._tick / self._freq, self._t_total)
-        desired_position = self._position_spline(t)
-        desired_velocity = self._position_spline(t, 1)
-        desired_acceleration = self._position_spline(t, 2)
+        if self._phase == "TO_ENTRY" and self._refresh_current_gate_if_observed(obs):
+            self._plan_to_entry(obs)
+        self._advance_phase(obs)
 
-        # Point the drone along the horizontal direction of travel.  Near zero velocity, keep the
-        # previous valid yaw to avoid atan2 noise at the beginning and end of the trajectory.
+        tracking_error = np.linalg.norm(
+            np.asarray(obs["pos"], dtype=np.float64) - self._last_desired_position
+        )
+        time_scale = np.clip(
+            1.0 - tracking_error / self._tracking_slowdown_distance, 0.15, 1.0
+        )
+        self._trajectory_time = min(
+            self._trajectory_time + time_scale / self._freq, self._trajectory_duration
+        )
+
+        assert self._local_spline is not None
+        desired_position = self._local_spline(self._trajectory_time)
+        desired_velocity = self._local_spline(self._trajectory_time, 1) * time_scale
+        desired_acceleration = self._local_spline(self._trajectory_time, 2) * time_scale**2
+        self._last_desired_position = desired_position.copy()
+
         horizontal_velocity = desired_velocity[:2]
         if np.linalg.norm(horizontal_velocity) > 1e-4:
             self._desired_yaw = float(np.arctan2(horizontal_velocity[1], horizontal_velocity[0]))
-        elif not hasattr(self, "_desired_yaw"):
-            self._desired_yaw = 0.0
-
         desired_quaternion = R.from_euler("z", self._desired_yaw).as_quat()
-        desired_angular_velocity = np.zeros(3)
 
         return np.concatenate(
             (
@@ -210,7 +385,7 @@ class V1StateController(Controller):
                 desired_velocity,
                 desired_acceleration,
                 desired_quaternion,
-                desired_angular_velocity,
+                np.zeros(3),
             ),
             dtype=np.float32,
         )
@@ -224,24 +399,26 @@ class V1StateController(Controller):
         truncated: bool,
         info: dict,
     ) -> bool:
-        """Advance trajectory time and stop after all configured gate passes are complete."""
+        """Use the environment's gate counter as the sole source of race progress."""
         del action, reward, terminated, truncated, info
+        gates_passed = int(obs["n_gates_passed"])
+        total_passes = len(obs["gate_sequence"])
+        self._finished = gates_passed >= total_passes
 
-        self._tick += 1
-        all_gates_passed = int(obs["n_gates_passed"]) >= len(obs["gate_sequence"])
-        trajectory_timed_out = self._tick / self._freq >= self._t_total + 2.0
-        self._finished = all_gates_passed or trajectory_timed_out
+        if not self._finished and gates_passed > self._pass_index:
+            self._pending_pass_index = gates_passed
+            self._phase = "TO_EXIT"
         return self._finished
 
     def episode_callback(self):
-        """Reset time-dependent state when an environment reuses this controller instance."""
-        self._tick = 0
-        self._finished = False
+        """No cross-episode learning is used by this baseline."""
 
     def render_callback(self, sim: Sim):
-        """Draw the planned path in green and the current setpoint in red."""
-        t = min(self._tick / self._freq, self._t_total)
-        setpoint = self._position_spline(t).reshape(1, -1)
-        trajectory = self._position_spline(np.linspace(0.0, self._t_total, 200))
+        """Draw only the currently active local trajectory."""
+        assert self._local_spline is not None
+        trajectory = self._local_spline(
+            np.linspace(0.0, self._trajectory_duration, 100)
+        )
+        setpoint = self._local_spline(self._trajectory_time).reshape(1, -1)
         draw_line(sim, trajectory, rgba=(0.0, 1.0, 0.0, 1.0))
         draw_points(sim, setpoint, rgba=(1.0, 0.0, 0.0, 1.0), size=0.025)
